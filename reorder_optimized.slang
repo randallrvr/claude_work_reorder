@@ -84,8 +84,7 @@ groupshared uint gs_total_full;           // broadcast: total full-wave elements
 [numthreads(256, 1, 1)]
 void reorderByMaterialOpt(
     StructuredBuffer<uint>    tileData,
-    RWStructuredBuffer<uint>  reorderedX,
-    RWStructuredBuffer<uint>  reorderedY,
+    RWStructuredBuffer<uint>  reorderedXY,
     RWStructuredBuffer<uint>  totalFullElements,
     uint3 groupTid : SV_GroupThreadID
 )
@@ -265,8 +264,9 @@ void reorderByMaterialOpt(
     uint is_ovfl = encoded >> 31u;
     uint out_pos = (encoded & ~OVERFLOW_FLAG) + is_ovfl * gs_total_full;
 
-    reorderedX[out_pos] = packed_xy & 0xFu;          // x
-    reorderedY[out_pos] = (packed_xy >> 4u) & 0xFu;  // y
+    uint x = packed_xy & 0xFu;
+    uint y = (packed_xy >> 4u) & 0xFu;
+    reorderedXY[out_pos] = (y << 16u) | x;
 
     if (tid == 0u)
         totalFullElements[0] = gs_total_full;

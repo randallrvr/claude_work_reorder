@@ -22,8 +22,8 @@ set(SHADER_DIR "${CMAKE_SOURCE_DIR}")
 set(SPV_DIR    "${CMAKE_BINARY_DIR}/shaders")
 file(MAKE_DIRECTORY ${SPV_DIR})
 
-set(SHADER_FILES   reorder.slang        reorder_optimized.slang        reorder_setassoc.slang)
-set(SHADER_ENTRIES reorderByMaterial    reorderByMaterialOpt           reorderByMaterialSetAssoc)
+set(SHADER_FILES   reorder.slang        reorder_optimized.slang        reorder_setassoc.slang        reorder_setassoc_v2.slang        reorder_setassoc_v3.slang        reorder_setassoc_v4.slang)
+set(SHADER_ENTRIES reorderByMaterial    reorderByMaterialOpt           reorderByMaterialSetAssoc     reorderByMaterialSetAssocV2      reorderByMaterialWaveMerge        reorderByMaterialV4)
 
 set(SPV_OUTPUTS "")
 list(LENGTH SHADER_FILES _shader_count)
@@ -51,10 +51,32 @@ endforeach()
 
 add_custom_target(shaders ALL DEPENDS ${SPV_OUTPUTS})
 
+# ── RenderDoc (optional) ─────────────────────────────────────────────────────
+# Look for renderdoc_app.h in standard install locations.
+# If found, enables --capture flag in the benchmark.
+find_path(RENDERDOC_INCLUDE_DIR renderdoc_app.h
+    HINTS ENV RENDERDOC_DIR
+          "C:/Program Files/RenderDoc"
+          "$ENV{ProgramFiles}/RenderDoc"
+          "/opt/renderdoc"
+          "/usr/local/include"
+    DOC "Directory containing renderdoc_app.h"
+)
+if(RENDERDOC_INCLUDE_DIR)
+    message(STATUS "Found RenderDoc: ${RENDERDOC_INCLUDE_DIR}")
+else()
+    message(STATUS "RenderDoc not found — capture support disabled")
+endif()
+
 # ── Benchmark executable ────────────────────────────────────────────────────
 add_executable(benchmark benchmark.cpp)
 target_link_libraries(benchmark PRIVATE Vulkan::Vulkan)
 add_dependencies(benchmark shaders)
+
+if(RENDERDOC_INCLUDE_DIR)
+    target_include_directories(benchmark PRIVATE ${RENDERDOC_INCLUDE_DIR})
+    target_compile_definitions(benchmark PRIVATE HAS_RENDERDOC)
+endif()
 
 # Copy .spv files next to the executable so it can find them at runtime.
 # On MSVC the exe goes to build/<Config>/, on single-config generators it's build/.

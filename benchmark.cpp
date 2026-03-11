@@ -35,6 +35,10 @@
 #include <string>
 #include <vector>
 
+#ifdef HAS_RENDERDOC
+#  include <renderdoc_app.h>
+#endif
+
 // ── Constants ───────────────────────────────────────────────────────────────
 static constexpr uint32_t TILE_W          = 16;
 static constexpr uint32_t TILE_H          = 16;
@@ -214,10 +218,66 @@ struct VulkanContext {
     VkCommandPool            cmdPool        = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties devProps     = {};
     float                    timestampPeriod = 1.0f; // ns per tick
+#ifdef HAS_RENDERDOC
+    RENDERDOC_API_1_6_0*     rdoc_api       = nullptr;
+#endif
 };
 
-static VulkanContext create_vulkan_context() {
+// ═════════════════════════════════════════════════════════════════════════════
+// RenderDoc initialization
+// ═════════════════════════════════════════════════════════════════════════════
+#ifdef HAS_RENDERDOC
+static RENDERDOC_API_1_6_0* init_renderdoc() {
+    RENDERDOC_API_1_6_0* rdoc_api = nullptr;
+
+#ifdef _WIN32
+    // Try to load renderdoc.dll — works if app is launched from RenderDoc
+    // or if renderdoc.dll is on PATH / next to exe.
+    HMODULE mod = GetModuleHandleA("renderdoc.dll");
+    if (!mod)
+        mod = LoadLibraryA("renderdoc.dll");
+    if (!mod) {
+        printf("RenderDoc: renderdoc.dll not loaded (launch from RenderDoc to enable capture)\n");
+        return nullptr;
+    }
+    pRENDERDOC_GetAPI RENDERDOC_GetAPI =
+        (pRENDERDOC_GetAPI)GetProcAddress(mod, "RENDERDOC_GetAPI");
+#else
+    void* mod = dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!mod) {
+        printf("RenderDoc: librenderdoc.so not loaded (launch from RenderDoc to enable capture)\n");
+        return nullptr;
+    }
+    pRENDERDOC_GetAPI RENDERDOC_GetAPI =
+        (pRENDERDOC_GetAPI)dlsym(mod, "RENDERDOC_GetAPI");
+#endif
+
+    if (!RENDERDOC_GetAPI) {
+        printf("RenderDoc: could not find RENDERDOC_GetAPI\n");
+        return nullptr;
+    }
+
+    int ret = RENDERDOC_GetAPI(eRENDERDOC_API_Version_1_6_0, (void**)&rdoc_api);
+    if (ret != 1 || !rdoc_api) {
+        printf("RenderDoc: RENDERDOC_GetAPI failed\n");
+        return nullptr;
+    }
+
+    printf("RenderDoc: API loaded successfully\n");
+    return rdoc_api;
+}
+#endif
+
+static VulkanContext create_vulkan_context(bool enable_renderdoc) {
     VulkanContext ctx;
+
+#ifdef HAS_RENDERDOC
+    // Init RenderDoc BEFORE creating the Vulkan instance so it can hook the API.
+    if (enable_renderdoc)
+        ctx.rdoc_api = init_renderdoc();
+#else
+    (void)enable_renderdoc;
+#endif
 
     // Instance
     VkApplicationInfo appInfo = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -559,9 +619,10 @@ static ComputePipeline create_compute_pipeline(
     for (auto& b : bindings) printf(" set=%u binding=%u", b.set, b.binding);
     printf("\n");
 
-    if (bindings.size() != 4) {
-        fprintf(stderr, "Expected 4 bindings, got %zu for %s\n",
-                bindings.size(), name.c_str());
+    uint32_t numBindings = (uint32_t)bindings.size();
+    if (numBindings < 3 || numBindings > 4) {
+        fprintf(stderr, "Expected 3 or 4 bindings, got %u for %s\n",
+                numBindings, name.c_str());
         exit(1);
     }
 
@@ -571,9 +632,9 @@ static ComputePipeline create_compute_pipeline(
     smCI.pCode    = reinterpret_cast<const uint32_t*>(spirv.data());
     VK_CHECK(vkCreateShaderModule(ctx.device, &smCI, nullptr, &cp.shaderModule));
 
-    // Descriptor set layout — 4 storage buffers from reflected bindings
-    std::vector<VkDescriptorSetLayoutBinding> dsBindings(4);
-    for (int i = 0; i < 4; i++) {
+    // Descriptor set layout — storage buffers from reflected bindings
+    std::vector<VkDescriptorSetLayoutBinding> dsBindings(numBindings);
+    for (uint32_t i = 0; i < numBindings; i++) {
         dsBindings[i] = {};
         dsBindings[i].binding         = bindings[i].binding;
         dsBindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -583,7 +644,7 @@ static ComputePipeline create_compute_pipeline(
 
     VkDescriptorSetLayoutCreateInfo dsLayoutCI =
         {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dsLayoutCI.bindingCount = 4;
+    dsLayoutCI.bindingCount = numBindings;
     dsLayoutCI.pBindings    = dsBindings.data();
     VK_CHECK(vkCreateDescriptorSetLayout(ctx.device, &dsLayoutCI, nullptr, &cp.dsLayout));
 
@@ -606,7 +667,7 @@ static ComputePipeline create_compute_pipeline(
     // Descriptor pool + set
     VkDescriptorPoolSize poolSize = {};
     poolSize.type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = 4;
+    poolSize.descriptorCount = numBindings;
 
     VkDescriptorPoolCreateInfo dpCI = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpCI.maxSets       = 1;
@@ -625,17 +686,17 @@ static ComputePipeline create_compute_pipeline(
 
 static void bind_buffers(const VulkanContext& ctx, ComputePipeline& cp,
                           const std::vector<SpvBinding>& bindings,
-                          GpuBuffer bufs[4]) {
-    // Update descriptor set: bind buffers in binding order
-    VkWriteDescriptorSet writes[4] = {};
-    VkDescriptorBufferInfo bufInfos[4] = {};
+                          const std::vector<GpuBuffer>& bufs) {
+    uint32_t n = (uint32_t)bindings.size();
+    std::vector<VkWriteDescriptorSet> writes(n);
+    std::vector<VkDescriptorBufferInfo> bufInfos(n);
 
-    for (int i = 0; i < 4; i++) {
+    for (uint32_t i = 0; i < n; i++) {
         bufInfos[i].buffer = bufs[i].buffer;
         bufInfos[i].offset = 0;
         bufInfos[i].range  = bufs[i].size;
 
-        writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         writes[i].dstSet          = cp.dsSet;
         writes[i].dstBinding      = bindings[i].binding;
         writes[i].dstArrayElement = 0;
@@ -644,7 +705,7 @@ static void bind_buffers(const VulkanContext& ctx, ComputePipeline& cp,
         writes[i].pBufferInfo     = &bufInfos[i];
     }
 
-    vkUpdateDescriptorSets(ctx.device, 4, writes, 0, nullptr);
+    vkUpdateDescriptorSets(ctx.device, n, writes.data(), 0, nullptr);
 }
 
 static void destroy_pipeline(const VulkanContext& ctx, ComputePipeline& cp) {
@@ -672,11 +733,14 @@ static VkQueryPool create_timestamp_pool(const VulkanContext& ctx, uint32_t coun
 // ═════════════════════════════════════════════════════════════════════════════
 static bool verify_result(const std::string& name,
                            const std::vector<uint32_t>& tile,
-                           const std::vector<uint32_t>& gpu_rx,
-                           const std::vector<uint32_t>& gpu_ry,
+                           const std::vector<uint32_t>& gpu_rxy,
                            uint32_t gpu_total_full,
                            const ReorderResult& cpu_ref) {
     bool ok = true;
+
+    // Unpack helper
+    auto unpack_x = [](uint32_t packed) { return packed & 0xFFFFu; };
+    auto unpack_y = [](uint32_t packed) { return packed >> 16u; };
 
     // 1. total_full must be a multiple of 32
     if (gpu_total_full % WAVE_SIZE != 0) {
@@ -695,16 +759,16 @@ static bool verify_result(const std::string& name,
     // 3. All positions must be in range and unique
     std::vector<bool> seen(TILE_ELEMENTS, false);
     for (uint32_t i = 0; i < TILE_ELEMENTS; i++) {
-        if (gpu_rx[i] >= TILE_W || gpu_ry[i] >= TILE_H) {
-            printf("  FAIL: out[%u] = (%u, %u) out of range\n",
-                   i, gpu_rx[i], gpu_ry[i]);
+        uint32_t rx = unpack_x(gpu_rxy[i]);
+        uint32_t ry = unpack_y(gpu_rxy[i]);
+        if (rx >= TILE_W || ry >= TILE_H) {
+            printf("  FAIL: out[%u] = (%u, %u) out of range\n", i, rx, ry);
             ok = false;
             continue;
         }
-        uint32_t flat = gpu_ry[i] * TILE_W + gpu_rx[i];
+        uint32_t flat = ry * TILE_W + rx;
         if (seen[flat]) {
-            printf("  FAIL: duplicate position (%u, %u) at index %u\n",
-                   gpu_rx[i], gpu_ry[i], i);
+            printf("  FAIL: duplicate position (%u, %u) at index %u\n", rx, ry, i);
             ok = false;
         }
         seen[flat] = true;
@@ -712,10 +776,10 @@ static bool verify_result(const std::string& name,
 
     // 4. Every 32-block in full section must be uniform material
     for (uint32_t base = 0; base < gpu_total_full; base += WAVE_SIZE) {
-        uint32_t first_mat = tile[gpu_ry[base] * TILE_W + gpu_rx[base]];
+        uint32_t first_mat = tile[unpack_y(gpu_rxy[base]) * TILE_W + unpack_x(gpu_rxy[base])];
         for (uint32_t j = 1; j < WAVE_SIZE && base + j < TILE_ELEMENTS; j++) {
             uint32_t idx = base + j;
-            uint32_t mat = tile[gpu_ry[idx] * TILE_W + gpu_rx[idx]];
+            uint32_t mat = tile[unpack_y(gpu_rxy[idx]) * TILE_W + unpack_x(gpu_rxy[idx])];
             if (mat != first_mat) {
                 printf("  FAIL: full-wave block at %u not uniform "
                        "(mat[%u]=%u != mat[%u]=%u)\n",
@@ -726,16 +790,27 @@ static bool verify_result(const std::string& name,
         }
     }
 
-    // 5. Overflow section must be sorted by material ID
-    for (uint32_t i = gpu_total_full + 1; i < TILE_ELEMENTS; i++) {
-        uint32_t prev_mat = tile[gpu_ry[i-1] * TILE_W + gpu_rx[i-1]];
-        uint32_t curr_mat = tile[gpu_ry[i]   * TILE_W + gpu_rx[i]];
-        if (curr_mat < prev_mat) {
-            printf("  FAIL: overflow not sorted at %u (mat %u > %u)\n",
-                   i, prev_mat, curr_mat);
-            ok = false;
-            break;
+    // 5. Overflow section must be grouped by material
+    {
+        std::vector<uint32_t> ovfl_mats;
+        for (uint32_t i = gpu_total_full; i < TILE_ELEMENTS; i++) {
+            uint32_t mat = tile[unpack_y(gpu_rxy[i]) * TILE_W + unpack_x(gpu_rxy[i])];
+            ovfl_mats.push_back(mat);
         }
+        for (size_t i = 1; i < ovfl_mats.size(); i++) {
+            if (ovfl_mats[i] != ovfl_mats[i - 1]) {
+                for (size_t j = 0; j < i - 1; j++) {
+                    if (ovfl_mats[j] == ovfl_mats[i]) {
+                        printf("  FAIL: overflow not grouped — mat %u "
+                               "reappears at overflow[%zu] after gap\n",
+                               ovfl_mats[i], i);
+                        ok = false;
+                        goto done_ovfl_check;
+                    }
+                }
+            }
+        }
+        done_ovfl_check:;
     }
 
     return ok;
@@ -766,13 +841,39 @@ static Stats compute_stats(std::vector<double>& times) {
 // ═════════════════════════════════════════════════════════════════════════════
 // Main
 // ═════════════════════════════════════════════════════════════════════════════
-int main() {
+int main(int argc, char* argv[]) {
+    // ── CLI parsing ─────────────────────────────────────────────────────
+    bool capture_mode = false;
+    std::string capture_kernel = "";  // empty = capture all kernels
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--capture") == 0) {
+            capture_mode = true;
+            // Optional: next arg can be a kernel name filter
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                capture_kernel = argv[++i];
+            }
+        }
+    }
+
+    if (capture_mode) {
+#ifdef HAS_RENDERDOC
+        printf("RenderDoc capture mode enabled");
+        if (!capture_kernel.empty())
+            printf(" (filter: \"%s\")", capture_kernel.c_str());
+        printf("\n");
+#else
+        fprintf(stderr, "Error: --capture requires building with RenderDoc support.\n");
+        fprintf(stderr, "  Install RenderDoc and reconfigure with cmake.\n");
+        return 1;
+#endif
+    }
+
     printf("═══════════════════════════════════════════════════════════════\n");
     printf("  Material Reorder — Vulkan Compute Benchmark\n");
     printf("═══════════════════════════════════════════════════════════════\n\n");
 
     // ── Vulkan init ─────────────────────────────────────────────────────
-    auto ctx = create_vulkan_context();
+    auto ctx = create_vulkan_context(capture_mode);
 
     // ── Generate tile ───────────────────────────────────────────────────
     auto tileData = generate_tile(42, 6);
@@ -791,8 +892,7 @@ int main() {
         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
     GpuBuffer buf_tile      = create_buffer(ctx, TILE_ELEMENTS * sizeof(uint32_t), usage, memFlags);
-    GpuBuffer buf_rx        = create_buffer(ctx, TILE_ELEMENTS * sizeof(uint32_t), usage, memFlags);
-    GpuBuffer buf_ry        = create_buffer(ctx, TILE_ELEMENTS * sizeof(uint32_t), usage, memFlags);
+    GpuBuffer buf_rxy       = create_buffer(ctx, TILE_ELEMENTS * sizeof(uint32_t), usage, memFlags);
     GpuBuffer buf_totalFull = create_buffer(ctx, sizeof(uint32_t), usage, memFlags);
 
     // Upload tile data
@@ -827,6 +927,9 @@ int main() {
         {exeDir + "/reorder.spv",           "reorderByMaterial",        "Baseline (bitonic)"},
         {exeDir + "/reorder_optimized.spv", "reorderByMaterialOpt",     "Optimized (wave)"},
         {exeDir + "/reorder_setassoc.spv",  "reorderByMaterialSetAssoc","Set-Assoc (hash)"},
+        {exeDir + "/reorder_setassoc_v2.spv","reorderByMaterialSetAssocV2","Set-Assoc v2 (wave-coop)"},
+        {exeDir + "/reorder_setassoc_v3.spv","reorderByMaterialWaveMerge","Set-Assoc v3 (wave-merge)"},
+        {exeDir + "/reorder_setassoc_v4.spv","reorderByMaterialV4","Set-Assoc v4 (parallel-merge)"},
     };
 
     // ── Results storage ─────────────────────────────────────────────────
@@ -851,16 +954,15 @@ int main() {
         // Reflect bindings for buffer binding
         auto bindings = reflect_bindings(read_file(kern.spvPath));
 
-        // Bind buffers: binding 0=tileData, 1=reorderedX, 2=reorderedY, 3=totalFull
-        GpuBuffer bufs[4] = {buf_tile, buf_rx, buf_ry, buf_totalFull};
+        // Bind buffers: binding 0=tileData, 1=reorderedXY, 2=totalFull
+        std::vector<GpuBuffer> bufs = {buf_tile, buf_rxy, buf_totalFull};
         bind_buffers(ctx, pipeline, bindings, bufs);
 
         // Lambda to dispatch once and optionally time
         auto dispatch_once = [&](bool record_time) -> double {
             // Clear output buffers
             uint32_t zeros[TILE_ELEMENTS] = {};
-            upload_buffer(ctx, buf_rx, zeros, TILE_ELEMENTS * sizeof(uint32_t));
-            upload_buffer(ctx, buf_ry, zeros, TILE_ELEMENTS * sizeof(uint32_t));
+            upload_buffer(ctx, buf_rxy, zeros, TILE_ELEMENTS * sizeof(uint32_t));
             uint32_t zero = 0;
             upload_buffer(ctx, buf_totalFull, &zero, sizeof(uint32_t));
 
@@ -920,14 +1022,12 @@ int main() {
         auto stats = compute_stats(times);
 
         // Readback and verify last run's results
-        std::vector<uint32_t> gpu_rx(TILE_ELEMENTS), gpu_ry(TILE_ELEMENTS);
+        std::vector<uint32_t> gpu_rxy(TILE_ELEMENTS);
         uint32_t gpu_total_full = 0;
-        readback_buffer(ctx, buf_rx, gpu_rx.data(), TILE_ELEMENTS * sizeof(uint32_t));
-        readback_buffer(ctx, buf_ry, gpu_ry.data(), TILE_ELEMENTS * sizeof(uint32_t));
+        readback_buffer(ctx, buf_rxy, gpu_rxy.data(), TILE_ELEMENTS * sizeof(uint32_t));
         readback_buffer(ctx, buf_totalFull, &gpu_total_full, sizeof(uint32_t));
 
-        bool verified = verify_result(kern.name, tileData.data,
-                                       gpu_rx, gpu_ry, gpu_total_full, cpuRef);
+        bool verified = verify_result(kern.name, tileData.data, gpu_rxy, gpu_total_full, cpuRef);
 
         printf("  Verification: %s\n", verified ? "PASS" : "FAIL");
         printf("  GPU total_full = %u\n", gpu_total_full);
@@ -935,6 +1035,25 @@ int main() {
                stats.mean, stats.median, stats.min_val, stats.p5, stats.p95);
 
         results.push_back({kern.name, stats, verified});
+
+        // ── RenderDoc capture ────────────────────────────────────────
+        // Run one extra dispatch wrapped in a capture frame, after timing
+        // is done so it doesn't affect benchmark results.
+#ifdef HAS_RENDERDOC
+        if (ctx.rdoc_api) {
+            bool should_capture = capture_kernel.empty() ||
+                kern.name.find(capture_kernel) != std::string::npos;
+            if (should_capture) {
+                printf("  Capturing RenderDoc frame...\n");
+                ctx.rdoc_api->StartFrameCapture(
+                    RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(ctx.instance), NULL);
+                dispatch_once(false);
+                ctx.rdoc_api->EndFrameCapture(
+                    RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(ctx.instance), NULL);
+                printf("  Capture saved.\n");
+            }
+        }
+#endif
 
         destroy_pipeline(ctx, pipeline);
     }
@@ -972,8 +1091,7 @@ int main() {
     vkDestroyQueryPool(ctx.device, tsPool, nullptr);
     vkFreeCommandBuffers(ctx.device, ctx.cmdPool, 1, &cmdBuf);
     destroy_buffer(ctx, buf_tile);
-    destroy_buffer(ctx, buf_rx);
-    destroy_buffer(ctx, buf_ry);
+    destroy_buffer(ctx, buf_rxy);
     destroy_buffer(ctx, buf_totalFull);
     vkDestroyCommandPool(ctx.device, ctx.cmdPool, nullptr);
     vkDestroyDevice(ctx.device, nullptr);

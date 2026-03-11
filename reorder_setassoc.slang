@@ -100,8 +100,7 @@ uint hashKey(uint key)
 [numthreads(256, 1, 1)]
 void reorderByMaterialSetAssoc(
     StructuredBuffer<uint>    tileData,
-    RWStructuredBuffer<uint>  reorderedX,
-    RWStructuredBuffer<uint>  reorderedY,
+    RWStructuredBuffer<uint>  reorderedXY,
     RWStructuredBuffer<uint>  totalFullElements,
     uint3 groupTid : SV_GroupThreadID
 )
@@ -228,8 +227,9 @@ void reorderByMaterialSetAssoc(
     }
 
     uint packed_xy = gs_pos[tid];
-    reorderedX[out_pos] = packed_xy & 0xFu;          // x
-    reorderedY[out_pos] = (packed_xy >> 4u) & 0xFu;  // y
+    uint x = packed_xy & 0xFu;
+    uint y = (packed_xy >> 4u) & 0xFu;
+    reorderedXY[out_pos] = (y << 16u) | x;
 
     if (tid == 0u)
         totalFullElements[0] = total_full;
